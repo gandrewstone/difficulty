@@ -1,15 +1,66 @@
-#!/usr/bin/env python3
-
+#!/usr/bin/env python2
+from __future__ import print_function
+import sys
+import pdb
 import argparse
 import datetime
 import math
 import random
-import statistics
+try:
+  import statistics
+except:
+  print("for python2, run 'sudo pip install statistics'")
 import sys
 import time
 from collections import namedtuple
 from functools import partial
 from operator import attrgetter
+from functools import partial
+
+from piec import *
+squareWave = False
+log = partial(print, file=sys.stderr)
+
+useTailRemoval = False
+
+PREFIX_BLOCKS = 2020
+
+SIM_LENGTH = 10000
+
+TARGET_1 = bits_to_target(486604799)
+
+INITIAL_BCC_BITS = 403458999
+INITIAL_SWC_BITS = 402734313
+INITIAL_FX = 0.18
+INITIAL_TIMESTAMP = 1503430225
+INITIAL_HASHRATE = 500    # In PH/s.
+INITIAL_HEIGHT = 481824
+
+# Steady hashrate mines the BCC chain all the time.  In PH/s.
+STEADY_HASHRATE = 300
+
+# simulate a single hashrate drop
+SQUARE_HASHRATE = STEADY_HASHRATE*10
+
+# Variable hash is split across both chains according to relative
+# revenue.  If the revenue ratio for either chain is at least 15%
+# higher, everything switches.  Otherwise the proportion mining the
+# chain is linear between +- 15%.
+VARIABLE_HASHRATE = 2000   # In PH/s.
+VARIABLE_PCT = 15   # 85% to 115%
+VARIABLE_WINDOW = 6  # No of blocks averaged to determine revenue ratio
+
+# Greedy hashrate switches chain if that chain is more profitable for
+# GREEDY_WINDOW BCC blocks.  It will only bother to switch if it has
+# consistently been GREEDY_PCT more profitable.
+GREEDY_HASHRATE = 1000     # In PH/s.
+GREEDY_PCT = 10
+GREEDY_WINDOW = 6
+
+State = namedtuple('State', 'height wall_time timestamp bits chainwork fx '
+                   'hashrate rev_ratio greedy_frac msg')
+
+states = []
 
 def bits_to_target(bits):
     size = bits >> 24
@@ -50,65 +101,74 @@ def target_to_bits(target):
 def bits_to_work(bits):
     return (2 << 255) // (bits_to_target(bits) + 1)
 
+INITIAL_SINGLE_WORK = bits_to_work(INITIAL_BCC_BITS)
+
 def target_to_hex(target):
     h = hex(target)[2:]
     return '0' * (64 - len(h)) + h
 
-TARGET_1 = bits_to_target(486604799)
+def next_bits_flat(msg):
+    interval_target = bits_to_target(states[-1].bits)
+    return target_to_bits(interval_target)
 
-INITIAL_BCC_BITS = 403458999
-INITIAL_SWC_BITS = 402734313
-INITIAL_FX = 0.18
-INITIAL_TIMESTAMP = 1503430225
-INITIAL_HASHRATE = 500    # In PH/s.
-INITIAL_HEIGHT = 481824
-INITIAL_SINGLE_WORK = bits_to_work(INITIAL_BCC_BITS)
+def next_bits_piec(msg):
+    interval_target = compute_piec_target(states)
+    if interval_target <= 0:
+        interval_target = 1
+    return target_to_bits(interval_target)
 
-# Steady hashrate mines the BCC chain all the time.  In PH/s.
-STEADY_HASHRATE = 300
+def compute_dyn_target(states):
+    P = 600 - int((states[-1].timestamp - states[-11].timestamp)/10.0)
 
-# Variable hash is split across both chains according to relative
-# revenue.  If the revenue ratio for either chain is at least 15%
-# higher, everything switches.  Otherwise the proportion mining the
-# chain is linear between +- 15%.
-VARIABLE_HASHRATE = 2000   # In PH/s.
-VARIABLE_PCT = 15   # 85% to 115%
-VARIABLE_WINDOW = 6  # No of blocks averaged to determine revenue ratio
+    adj = float(P)*0.01
+    adjFrac = 1.0 + adj/600.0
 
-# Greedy hashrate switches chain if that chain is more profitable for
-# GREEDY_WINDOW BCC blocks.  It will only bother to switch if it has
-# consistently been GREEDY_PCT more profitable.
-GREEDY_HASHRATE = 2000     # In PH/s.
-GREEDY_PCT = 10
-GREEDY_WINDOW = 6
+    if adjFrac > 1.05:
+        adjFrac = 1.05
+    if adjFrac < .95:
+        adjFrac = .95
 
-State = namedtuple('State', 'height wall_time timestamp bits chainwork fx '
-                   'hashrate rev_ratio greedy_frac msg')
+    target = 0
+    for state in states[-11:-1]:
+        target += bits_to_target(state.bits)
+    target /= 10
+    target /= adjFrac  # The lower the target, the more difficult
+#    pdb.set_trace()
+    return int(target)
 
-states = []
 
-def print_headers():
-    print(', '.join(['Height', 'FX', 'Block Time', 'Unix', 'Timestamp',
+def next_bits_dyn(msg):
+    interval_target = compute_dyn_target(states)
+    if interval_target <= 0:
+        interval_target = 1
+    return target_to_bits(interval_target)
+
+def print_headers(fil=sys.stdout):
+    fil.write(', '.join(['Height', 'FX', 'Block Time', 'Unix', 'Timestamp',
                      'Difficulty (bn)', 'Implied Difficulty (bn)',
-                     'Hashrate (PH/s)', 'Rev Ratio', 'Greedy?', 'Comments']))
+                         'Hashrate (PH/s)', 'Rev Ratio', 'Greedy?', 'Comments']) + "\n")
 
-def print_state():
-    state = states[-1]
-    block_time = state.timestamp - states[-2].timestamp
-    t = datetime.datetime.fromtimestamp(state.timestamp)
+def print_state(state=None, priorState=None, fil=sys.stdout):
+    if state is None:
+        state = states[-1]
+        priorState = states[-2]
+    block_time = state.timestamp - priorState.timestamp
+    if state.timestamp < 10000000000:
+      t = datetime.datetime.fromtimestamp(state.timestamp)
+    t = None
     difficulty = TARGET_1 / bits_to_target(state.bits)
     implied_diff = TARGET_1 / ((2 << 255) / (state.hashrate * 1e15 * 600))
-    print(', '.join(['{:d}'.format(state.height),
+    fil.write(', '.join(['{:d}'.format(state.height),
                      '{:.8f}'.format(state.fx),
                      '{:d}'.format(block_time),
                      '{:d}'.format(state.timestamp),
-                     '{:%Y-%m-%d %H:%M:%S}'.format(t),
+                     '{:%Y-%m-%d %H:%M:%S}'.format(t) if t else "",
                      '{:.2f}'.format(difficulty / 1e9),
                      '{:.2f}'.format(implied_diff / 1e9),
                      '{:.0f}'.format(state.hashrate),
                      '{:.3f}'.format(state.rev_ratio),
                      'Yes' if state.greedy_frac == 1.0 else 'No',
-                     state.msg]))
+                          state.msg]) + "\n")
 
 def revenue_ratio(fx, BCC_target):
     '''Returns the instantaneous SWC revenue rate divided by the
@@ -225,12 +285,9 @@ def next_bits_cw(msg, block_count):
     interval_target = compute_cw_target(block_count)
     return target_to_bits(interval_target)
 
-def next_bits_wt(msg, block_count, limit_precision):
-    DIFF_WEIGHT_PRECISION = 1000000
-
+def next_bits_wt(msg, block_count):
     first, last  = -1-block_count, -1
     last_target = bits_to_target(states[last].bits)
-    last_target_fixed = last_target // DIFF_WEIGHT_PRECISION
     timespan = 0
     prior_timestamp = states[first].timestamp
     for i in range(first + 1, last + 1):
@@ -239,34 +296,12 @@ def next_bits_wt(msg, block_count, limit_precision):
         timestamp = max(states[i].timestamp, prior_timestamp)
         time_i = timestamp - prior_timestamp
         prior_timestamp = timestamp
-        if limit_precision:
-            adj_time_i = time_i * (target_i // DIFF_WEIGHT_PRECISION) // last_target_fixed
-        else:
-            adj_time_i = time_i * target_i // last_target # Difficulty weight
+        adj_time_i = time_i * target_i // last_target # Difficulty weight
         timespan += adj_time_i * (i - first) # Recency weight
     timespan = timespan * 2 // (block_count + 1) # Normalize recency weight
     target = last_target * timespan # Standard retarget
     target //= 600 * block_count
     return target_to_bits(target)
-
-def next_bits_wt_compare(msg, block_count, limit_precision):
-    with open("current_state.csv", 'w') as fh:
-        for s in states:
-            fh.write("%s,%s,%s\n" % (s.height, s.bits, s.timestamp))
-
-    from subprocess import Popen, PIPE
-
-    process = Popen(["./cashwork"], stdout=PIPE)
-    (next_bits, err) = process.communicate()
-    exit_code = process.wait()
-
-    next_bits = int(next_bits.decode())
-    next_bits_py = next_bits_wt(msg, block_count, limit_precision)
-    if next_bits != next_bits_py:
-        print("ERROR: Bits don't match. External %s, local %s" % (next_bits, next_bits_py))
-        assert(next_bits == next_bits_py)
-    return next_bits
-
 
 def next_bits_dgw3(msg, block_count):
     ''' Dark Gravity Wave v3 from Dash '''
@@ -327,10 +362,38 @@ def block_time(mean_time):
 def next_fx_random(r):
     return states[-1].fx * (1.0 + (r - 0.5) / 200)
 
+def next_fx_static(r):
+    return states[-1].fx
+
+def next_fx_square(r):
+    global squareWave
+    squareWave = True
+    return states[-1].fx
+
 def next_fx_ramp(r):
     return states[-1].fx * 1.00017149454
 
-def next_step(algo, scenario, fx_jump_factor):
+DDBEGIN=600*2
+DECLINE_TIME=600*2
+def tailremoval(hashrate, target, seconds):
+    # reduce difficulty based on time to mine
+    if seconds > DDBEGIN:
+        difficulty = TARGET_1 / target
+        decline = difficulty/DECLINE_TIME
+        difficulty = difficulty - (seconds-DDBEGIN)*decline
+        if difficulty < 1:
+            difficulty = 1
+        target = TARGET_1 / difficulty
+    # simulate 1 second of mining
+    mean_hashes = pow(2, 256) // target
+    mean_time = mean_hashes / hashrate
+    chance = 1.0/mean_time
+    num = random.random()
+    if num < chance:
+        return int(target)
+    return 0
+
+def next_step(algo, scenario, fx_jump_factor, count, timestamp):
     # First figure out our hashrate
     msg = []
     high = 1.0 + VARIABLE_PCT / 100
@@ -354,14 +417,37 @@ def next_step(algo, scenario, fx_jump_factor):
     hashrate = (STEADY_HASHRATE + scenario.dr_hashrate
                 + VARIABLE_HASHRATE * var_fraction
                 + GREEDY_HASHRATE * greedy_frac)
+
+    if squareWave:
+      hashrate = STEADY_HASHRATE  # + scenario.dr_hashrate
+      if SQUARE_HASHRATE and timestamp > INITIAL_TIMESTAMP + 1000*600:  # count > SIM_LENGTH/4:
+        hashrate = SQUARE_HASHRATE
+      if SQUARE_HASHRATE and timestamp > INITIAL_TIMESTAMP + 4000*600:  # count > 3*SIM_LENGTH/4:
+        hashrate = STEADY_HASHRATE
+      if SQUARE_HASHRATE and timestamp > INITIAL_TIMESTAMP + 8000*600:  # count > 3*SIM_LENGTH/4:
+        hashrate = SQUARE_HASHRATE
+
     # Calculate our dynamic difficulty
     bits = algo.next_bits(msg, **algo.params)
     target = bits_to_target(bits)
     # See how long we take to mine a block
-    mean_hashes = pow(2, 256) // target
-    mean_time = mean_hashes / (hashrate * 1e15)
-    time = int(block_time(mean_time) + 0.5)
-    wall_time = states[-1].wall_time + time
+#   pdb.set_trace()
+
+    if useTailRemoval:
+        seconds = 0
+        while 1:
+          newtarget = tailremoval(hashrate * 1e15, target, seconds)
+          if newtarget: break
+          seconds += 1
+        wall_time = states[-1].wall_time + seconds
+        # set to make the block reflect the new target
+        # bits = target_to_bits(newtarget)
+    else:
+        mean_hashes = pow(2, 256) // target
+        mean_time = mean_hashes / (hashrate * 1e15)
+        time = int(block_time(mean_time) + 0.5)
+        wall_time = states[-1].wall_time + time
+
     # Did the difficulty ramp hashrate get the block?
     if random.random() < (scenario.dr_hashrate / hashrate):
         timestamp = median_time_past(states[-11:]) + 1
@@ -385,6 +471,9 @@ def next_step(algo, scenario, fx_jump_factor):
 Algo = namedtuple('Algo', 'next_bits params')
 
 Algos = {
+    "flat": Algo(next_bits_flat,{}),
+    "piec" : Algo(next_bits_piec, {}),
+    "dyn" : Algo(next_bits_dyn, {}),
     'k-1' : Algo(next_bits_k, {
         'mtp_window': 6,
         'high_barrier': 60 * 128,
@@ -416,7 +505,6 @@ Algos = {
     }),
     'wt-144' : Algo(next_bits_wt, {
         'block_count': 144,
-        'limit_precision' : False
     }),
     'dgw3-24' : Algo(next_bits_dgw3, { # 24-blocks, like Dash
         'block_count': 24,
@@ -434,17 +522,14 @@ Algos = {
         'window_3': 71,
         'window_4': 137,
     }),
-    # runs wt-144 in external program, compares with python implementation.
-    'wt-144-compare' : Algo(next_bits_wt_compare, {
-        'block_count': 144,
-        'limit_precision' : True
-    })
 }
 
 Scenario = namedtuple('Scenario', 'next_fx params, dr_hashrate')
 
 Scenarios = {
     'default' : Scenario(next_fx_random, {}, 0),
+    'static' : Scenario(next_fx_static, {}, 0),
+    'square' : Scenario(next_fx_square, {}, 0),
     'fxramp' : Scenario(next_fx_ramp, {}, 0),
     # Difficulty rampers with given PH/s
     'dr50' : Scenario(next_fx_random, {}, 50),
@@ -453,10 +538,14 @@ Scenarios = {
 }
 
 def run_one_simul(algo, scenario, print_it):
-    states.clear()
+    global states
+    if sys.hexversion < 0x3000000:
+        states = []
+    else:
+        states.clear()
 
-    # Initial state is afer 2020 steady prefix blocks
-    N = 2020
+    # Initial state is after 2020 steady prefix blocks
+    N = PREFIX_BLOCKS
     for n in range(-N, 0):
         state = State(INITIAL_HEIGHT + n, INITIAL_TIMESTAMP + n * 600,
                       INITIAL_TIMESTAMP + n * 600,
@@ -474,11 +563,14 @@ def run_one_simul(algo, scenario, print_it):
     # Run the simulation
     if print_it:
         print_headers()
-    for n in range(10000):
+    count=0
+    for n in range(SIM_LENGTH):
         fx_jump_factor = fx_jumps.get(n, 1.0)
-        next_step(algo, scenario, fx_jump_factor)
+        timestamp = states[-1].timestamp
+        next_step(algo, scenario, fx_jump_factor, count, timestamp)
         if print_it:
             print_state()
+        count +=1
 
     # Drop the prefix blocks to be left with the simulation blocks
     simul = states[N:]
@@ -487,14 +579,42 @@ def run_one_simul(algo, scenario, print_it):
                    for n in range(len(simul) - 1)]
     return block_times
 
+def run(algo_name, scenario_name, seed, tailremoval, filename=None):
+    global useTailRemoval
+    algo = Algos.get(algo_name)
+    scenario = Scenarios.get(scenario_name)
+    if seed is None:
+      seed = int(time.time())
+
+    useTailRemoval = tailremoval
+
+    block_times = run_one_simul(algo, scenario, False)
+    if filename:
+        with open(filename,"w") as f:
+            print_headers(f)
+            p = None
+            for s in states[PREFIX_BLOCKS-1:]:
+                if p: print_state(s,p,f)
+                p = s
+
+    mean = statistics.mean(block_times)
+    std_dev  = statistics.stdev(block_times)
+    median = sorted(block_times)[len(block_times) // 2]
+    mx = max(block_times)
+    log("%s.%s: mean: %0.1f median: %0.1f stdev: %0.1f max:%0.1f\n" % (algo_name, scenario_name, mean, std_dev, median, mx))
+
+
+    return states
 
 def main():
     '''Outputs CSV data to stdout.   Final stats to stderr.'''
+    global useTailRemoval
 
     parser = argparse.ArgumentParser('Run a mining simulation')
     parser.add_argument('-a', '--algo', metavar='algo', type=str,
                         choices = list(Algos.keys()),
                         default = 'k-1', help='algorithm choice')
+    parser.add_argument('-t', '--tailremoval', action="store_true")
     parser.add_argument('-s', '--scenario', metavar='scenario', type=str,
                         choices = list(Scenarios.keys()),
                         default = 'default', help='scenario choice')
@@ -504,6 +624,8 @@ def main():
                         default = 1, help='count of simuls to run')
     args = parser.parse_args()
 
+    useTailRemoval = args.tailremoval
+    log("Tail Removal? ", useTailRemoval)
     count = max(1, args.count)
     algo = Algos.get(args.algo)
     scenario = Scenarios.get(args.scenario)
@@ -511,6 +633,7 @@ def main():
 
     to_stderr = partial(print, file=sys.stderr)
     to_stderr("Starting seed {} for {} simuls".format(seed, count))
+
 
     means = []
     std_devs = []
@@ -543,3 +666,19 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+def run4(scenario, filesfx = "", dyn=False):
+    seed = 1234
+    states = run("piec",scenario,seed,dyn, "piec%s.csv" % filesfx)
+    states = run("wt-144",scenario,seed,dyn, "wt144%s.csv" % filesfx)
+    states = run("k-1",scenario,seed,dyn, "k1%s.csv" % filesfx)
+    states = run("cw-144",scenario,seed,dyn, "cw144%s.csv" % filesfx)
+
+def Test():
+    scenario = "square"
+    run4(scenario, "", False)
+    print("tail removal difficulty adjustment")
+    run4(scenario, "_tr", True)
+
+    #sys.argv = "./mining.py -r 110 -a dyn -s static -d".split()
+    #main()
