@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 from __future__ import print_function
 import sys
 import pdb
@@ -19,6 +19,12 @@ from functools import partial
 
 from piec import *
 squareWave = False
+squareWave2 = False
+squareWaveInterval = 1
+
+lowMiner = False
+lookBackInterval = 100
+
 log = partial(print, file=sys.stderr)
 
 useTailRemoval = False
@@ -37,10 +43,13 @@ INITIAL_HASHRATE = 500    # In PH/s.
 INITIAL_HEIGHT = 481824
 
 # Steady hashrate mines the BCC chain all the time.  In PH/s.
-STEADY_HASHRATE = 300
+STEADY_HASHRATE = 500
 
 # simulate a single hashrate drop
 SQUARE_HASHRATE = STEADY_HASHRATE*10
+
+SQUARE2_HASHRATE = STEADY_HASHRATE*10
+LOWMINER_HASHRATE = STEADY_HASHRATE/2
 
 # Variable hash is split across both chains according to relative
 # revenue.  If the revenue ratio for either chain is at least 15%
@@ -370,6 +379,16 @@ def next_fx_square(r):
     squareWave = True
     return states[-1].fx
 
+def next_fx_square2(r):
+    global squareWave2
+    squareWave2 = True
+    return states[-1].fx
+
+def next_fx_lowminer(r):
+    global lowMiner
+    lowMiner = True
+    return states[-1].fx
+
 def next_fx_ramp(r):
     return states[-1].fx * 1.00017149454
 
@@ -394,27 +413,32 @@ def tailremoval(hashrate, target, seconds):
     return 0
 
 def next_step(algo, scenario, fx_jump_factor, count, timestamp):
+    global squareWave
+    global squareWave2
+    global lowMiner
     # First figure out our hashrate
     msg = []
-    high = 1.0 + VARIABLE_PCT / 100
-    scale_fac = 50 / VARIABLE_PCT
-    N = VARIABLE_WINDOW
-    mean_rev_ratio = sum(state.rev_ratio for state in states[-N:]) / N
-    var_fraction = max(0, min(1, (high - mean_rev_ratio) * scale_fac))
+    greedy_frac = 0.0
+    if not squareWave and not squareWave2 and not lowMiner:
+      high = 1.0 + VARIABLE_PCT / 100
+      scale_fac = 50 / VARIABLE_PCT
+      N = VARIABLE_WINDOW
+      mean_rev_ratio = sum(state.rev_ratio for state in states[-N:]) / N
+      var_fraction = max(0, min(1, (high - mean_rev_ratio) * scale_fac))
 
-    N = GREEDY_WINDOW
-    gready_rev_ratio = sum(state.rev_ratio for state in states[-N:]) / N
-    greedy_frac = states[-1].greedy_frac
-    if mean_rev_ratio >= 1 + GREEDY_PCT / 100:
+      N = GREEDY_WINDOW
+      gready_rev_ratio = sum(state.rev_ratio for state in states[-N:]) / N
+      greedy_frac = states[-1].greedy_frac
+      if mean_rev_ratio >= 1 + GREEDY_PCT / 100:
         if greedy_frac != 0.0:
             msg.append("Greedy miners left")
         greedy_frac = 0.0
-    elif mean_rev_ratio <= 1 - GREEDY_PCT / 100:
+      elif mean_rev_ratio <= 1 - GREEDY_PCT / 100:
         if greedy_frac != 1.0:
             msg.append("Greedy miners joined")
         greedy_frac = 1.0
 
-    hashrate = (STEADY_HASHRATE + scenario.dr_hashrate
+      hashrate = (STEADY_HASHRATE + scenario.dr_hashrate
                 + VARIABLE_HASHRATE * var_fraction
                 + GREEDY_HASHRATE * greedy_frac)
 
@@ -426,6 +450,32 @@ def next_step(algo, scenario, fx_jump_factor, count, timestamp):
         hashrate = STEADY_HASHRATE
       if SQUARE_HASHRATE and timestamp > INITIAL_TIMESTAMP + 8000*600:  # count > 3*SIM_LENGTH/4:
         hashrate = SQUARE_HASHRATE
+
+    elif squareWave2:
+      global squareWaveInterval
+      if (int(count/squareWaveInterval))&1 == 0:
+          hashrate = STEADY_HASHRATE  # + scenario.dr_hashrate
+      else:
+          hashrate = STEADY_HASHRATE + SQUARE2_HASHRATE
+
+    elif lowMiner:
+        totalTgt=0
+        mint = bits_to_target(states[-1].bits)
+        maxt = 0
+        for idx in range(1,lookBackInterval+1):
+            s = states[-idx]
+            target = bits_to_target(s.bits)
+            totalTgt += target
+            if target < mint:
+                mint = target
+            if target > maxt:
+                maxt = target
+        avgTgt = totalTgt/lookBackInterval
+        # if bits_to_target(states[-1].bits) > (maxt - avgTgt)/4 + avgTgt:
+        if bits_to_target(states[-1].bits) > avgTgt:
+            hashrate = STEADY_HASHRATE + LOWMINER_HASHRATE
+        else:
+            hashrate = STEADY_HASHRATE
 
     # Calculate our dynamic difficulty
     bits = algo.next_bits(msg, **algo.params)
@@ -530,6 +580,8 @@ Scenarios = {
     'default' : Scenario(next_fx_random, {}, 0),
     'static' : Scenario(next_fx_static, {}, 0),
     'square' : Scenario(next_fx_square, {}, 0),
+    'square2' : Scenario(next_fx_square2, {}, 0),
+    'lowminer' : Scenario(next_fx_lowminer, {}, 0),
     'fxramp' : Scenario(next_fx_ramp, {}, 0),
     # Difficulty rampers with given PH/s
     'dr50' : Scenario(next_fx_random, {}, 50),
@@ -601,10 +653,9 @@ def run(algo_name, scenario_name, seed, tailremoval, filename=None):
     std_dev  = statistics.stdev(block_times)
     median = sorted(block_times)[len(block_times) // 2]
     mx = max(block_times)
-    log("%s.%s: mean: %0.1f median: %0.1f stdev: %0.1f max:%0.1f\n" % (algo_name, scenario_name, mean, std_dev, median, mx))
+    log("%s.%s: mean: %0.1f median: %0.1f stdev: %0.1f max:%0.1f (%s)\n" % (algo_name, scenario_name, mean, std_dev, median, mx, filename))
 
-
-    return states
+    return (states, mean, std_dev, median, mx)
 
 def main():
     '''Outputs CSV data to stdout.   Final stats to stderr.'''
@@ -668,17 +719,41 @@ if __name__ == '__main__':
     main()
 
 def run4(scenario, filesfx = "", dyn=False):
-    seed = 1234
+    seed = 5
     states = run("piec",scenario,seed,dyn, "piec%s.csv" % filesfx)
     states = run("wt-144",scenario,seed,dyn, "wt144%s.csv" % filesfx)
     states = run("k-1",scenario,seed,dyn, "k1%s.csv" % filesfx)
     states = run("cw-144",scenario,seed,dyn, "cw144%s.csv" % filesfx)
 
+def runProfit():
+    global squareWaveInterval
+    global lookBackInterval
+    #global squareWave2
+    global lowMiner
+    seed = 123456
+    dyn = False
+    #scenario = "square2"
+    scenario = "lowminer"
+    #algo = "wt-144"
+    algo = "piec"
+    #squareWave2 = True
+    lowMiner = True
+    for interval in range(5,500,5):
+    #for interval in range(1,500):
+        #squareWaveInterval = interval
+        lookBackInterval = interval
+        (states, mean, std_dev, median, mx) = run(algo, scenario, seed + interval, dyn, algo + "_l" + str(interval) + ".csv")
+
 def Test():
-    scenario = "square"
-    run4(scenario, "", False)
-    print("tail removal difficulty adjustment")
-    run4(scenario, "_tr", True)
+    runProfit()
+    
+    #scenario = "square"
+    #run4(scenario, "", False)
+
+    #print("tail removal difficulty adjustment")
+    #run4(scenario, "_tr", True)
+    #run4("fxramp","_fxramp")
+    #run4("dr100","_dr100")
 
     #sys.argv = "./mining.py -r 110 -a dyn -s static -d".split()
     #main()
